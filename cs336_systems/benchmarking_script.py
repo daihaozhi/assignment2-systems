@@ -41,9 +41,15 @@ def _parse_args() -> argparse.Namespace:
         default="float32",
     )
     parser.add_argument(
-        "--use-bf16",
+        "--use-amp",
         action="store_true",
-        help="Force bfloat16 precision for model weights and compute.",
+        help="Use mixed precision autocast (model params stay fp32 by default).",
+    )
+    parser.add_argument(
+        "--amp-dtype",
+        choices=("bfloat16", "float16"),
+        default="bfloat16",
+        help="Autocast dtype when --use-amp is enabled.",
     )
     parser.add_argument("--seed", type=int, default=42)
 
@@ -62,6 +68,14 @@ def _resolve_dtype(dtype_name: str) -> torch.dtype:
 def _sync_if_cuda(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+
+
+def _autocast_or_nullcontext(
+    use_amp: bool, device: torch.device, amp_dtype: torch.dtype
+) -> contextlib.AbstractContextManager:
+    if not use_amp:
+        return contextlib.nullcontext()
+    return torch.autocast(device_type=device.type, dtype=amp_dtype)
 
 
 @contextlib.contextmanager
@@ -83,7 +97,11 @@ def main() -> None:
         raise ValueError("sequence_length must be <= context_length.")
 
     device = torch.device(args.device)
-    dtype = torch.bfloat16 if args.use_bf16 else _resolve_dtype(args.dtype)
+    if args.use_amp and device.type != "cuda":
+        raise ValueError("--use-amp currently requires --device cuda.")
+
+    amp_dtype = _resolve_dtype(args.amp_dtype)
+    dtype = torch.float32 if args.use_amp else _resolve_dtype(args.dtype)
     use_nvtx = device.type == "cuda"
 
     model = BasicsTransformerLM(
@@ -98,6 +116,8 @@ def main() -> None:
 
     model.train(args.mode != "forward")
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.optimizer_lr)
+    use_grad_scaler = args.use_amp and amp_dtype == torch.float16 and device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_grad_scaler)
 
     token_ids = torch.randint(
         low=0,
@@ -110,31 +130,44 @@ def main() -> None:
     def forward_step() -> None:
         with torch.no_grad():
             with _nvtx_range("forward", use_nvtx):
-                _ = model(token_ids)
+                with _autocast_or_nullcontext(args.use_amp, device, amp_dtype):
+                    _ = model(token_ids)
         _sync_if_cuda(device)
 
     def forward_backward_step() -> None:
         with _nvtx_range("zero_grad", use_nvtx):
             model.zero_grad(set_to_none=True)
         with _nvtx_range("forward", use_nvtx):
-            logits = model(token_ids)
+            with _autocast_or_nullcontext(args.use_amp, device, amp_dtype):
+                logits = model(token_ids)
         with _nvtx_range("loss", use_nvtx):
             loss = logits.mean()
         with _nvtx_range("backward", use_nvtx):
-            loss.backward()
+            if scaler.is_enabled():
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
         _sync_if_cuda(device)
 
     def forward_backward_optimizer_step() -> None:
         with _nvtx_range("zero_grad", use_nvtx):
             optimizer.zero_grad(set_to_none=True)
         with _nvtx_range("forward", use_nvtx):
-            logits = model(token_ids)
+            with _autocast_or_nullcontext(args.use_amp, device, amp_dtype):
+                logits = model(token_ids)
         with _nvtx_range("loss", use_nvtx):
             loss = logits.mean()
         with _nvtx_range("backward", use_nvtx):
-            loss.backward()
+            if scaler.is_enabled():
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
         with _nvtx_range("optimizer_step", use_nvtx):
-            optimizer.step()
+            if scaler.is_enabled():
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
         _sync_if_cuda(device)
 
     step_fn_by_mode = {
@@ -156,7 +189,11 @@ def main() -> None:
     print("Benchmark Results")
     print(f"mode: {args.mode}")
     print(f"device: {device}")
-    print(f"dtype: {dtype}")
+    if args.use_amp:
+        print(f"precision: amp ({args.amp_dtype})")
+        print("model_param_dtype: torch.float32")
+    else:
+        print(f"precision: full ({dtype})")
     if args.mode == "forward_backward_optimizer":
         print(f"optimizer_lr: {args.optimizer_lr}")
     print(f"warmup_steps (w): {args.warmup_steps}")
