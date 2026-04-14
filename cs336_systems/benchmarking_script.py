@@ -22,7 +22,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--d-ff", type=int, default=3072)
     parser.add_argument("--rope-theta", type=float, default=10000.0)
 
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--sequence-length", type=int, default=256)
 
     parser.add_argument("--warmup-steps", type=int, default=10, help="w")
@@ -39,6 +39,11 @@ def _parse_args() -> argparse.Namespace:
         "--dtype",
         choices=("float32", "float16", "bfloat16"),
         default="float32",
+    )
+    parser.add_argument(
+        "--use-bf16",
+        action="store_true",
+        help="Force bfloat16 precision for model weights and compute.",
     )
     parser.add_argument("--seed", type=int, default=42)
 
@@ -78,7 +83,7 @@ def main() -> None:
         raise ValueError("sequence_length must be <= context_length.")
 
     device = torch.device(args.device)
-    dtype = _resolve_dtype(args.dtype)
+    dtype = torch.bfloat16 if args.use_bf16 else _resolve_dtype(args.dtype)
     use_nvtx = device.type == "cuda"
 
     model = BasicsTransformerLM(
