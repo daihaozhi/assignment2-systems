@@ -52,6 +52,18 @@ def _parse_args() -> argparse.Namespace:
         help="Autocast dtype when --use-amp is enabled.",
     )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--memory-snapshot-path",
+        type=str,
+        default=None,
+        help="If set and running on CUDA, dump torch.cuda.memory snapshot pickle to this path.",
+    )
+    parser.add_argument(
+        "--memory-history-max-entries",
+        type=int,
+        default=1000000,
+        help="max_entries for torch.cuda.memory._record_memory_history().",
+    )
 
     return parser.parse_args()
 
@@ -176,13 +188,35 @@ def main() -> None:
         "forward_backward_optimizer": forward_backward_optimizer_step,
     }
     step_fn = step_fn_by_mode[args.mode]
+    memory_history_supported = (
+        hasattr(torch.cuda, "memory")
+        and hasattr(torch.cuda.memory, "_record_memory_history")
+        and hasattr(torch.cuda.memory, "_dump_snapshot")
+    )
+    enable_memory_snapshot = (
+        device.type == "cuda" and args.memory_snapshot_path is not None and memory_history_supported
+    )
+    memory_snapshot_dumped = False
 
     for _ in range(args.warmup_steps):
         step_fn()
 
     _sync_if_cuda(device)
-    total_seconds = timeit.timeit(step_fn, number=args.measure_steps)
-    _sync_if_cuda(device)
+    if enable_memory_snapshot:
+        torch.cuda.memory._record_memory_history(max_entries=args.memory_history_max_entries)
+    elif device.type == "cuda" and args.memory_snapshot_path is not None and not memory_history_supported:
+        print("warning: torch.cuda.memory snapshot APIs are unavailable in this PyTorch build.")
+
+    try:
+        total_seconds = timeit.timeit(step_fn, number=args.measure_steps)
+        _sync_if_cuda(device)
+    finally:
+        if enable_memory_snapshot:
+            try:
+                torch.cuda.memory._dump_snapshot(args.memory_snapshot_path)
+                memory_snapshot_dumped = True
+            finally:
+                torch.cuda.memory._record_memory_history(enabled=None)
 
     ms_per_step = (total_seconds / args.measure_steps) * 1000.0
 
@@ -200,6 +234,8 @@ def main() -> None:
     print(f"measure_steps (n): {args.measure_steps}")
     print(f"total_time_seconds: {total_seconds:.6f}")
     print(f"time_per_step_ms: {ms_per_step:.3f}")
+    if memory_snapshot_dumped:
+        print(f"memory_snapshot_path: {args.memory_snapshot_path}")
 
 
 if __name__ == "__main__":
