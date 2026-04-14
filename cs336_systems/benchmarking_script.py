@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import timeit
 
 import torch
@@ -10,7 +11,7 @@ from cs336_basics.model import BasicsTransformerLM
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Benchmark cs336_basics model forward or forward+backward pass."
+        description="Benchmark cs336_basics model forward, forward+backward, or forward+backward+optimizer pass."
     )
 
     parser.add_argument("--vocab-size", type=int, default=50257)
@@ -28,9 +29,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--measure-steps", type=int, default=50, help="n")
     parser.add_argument(
         "--mode",
-        choices=("forward", "forward_backward"),
+        choices=("forward", "forward_backward", "forward_backward_optimizer"),
         default="forward",
     )
+    parser.add_argument("--optimizer-lr", type=float, default=1e-3)
 
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument(
@@ -57,6 +59,17 @@ def _sync_if_cuda(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
+@contextlib.contextmanager
+def _nvtx_range(name: str, enabled: bool):
+    if enabled:
+        torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        if enabled:
+            torch.cuda.nvtx.range_pop()
+
+
 def main() -> None:
     args = _parse_args()
     torch.manual_seed(args.seed)
@@ -66,6 +79,7 @@ def main() -> None:
 
     device = torch.device(args.device)
     dtype = _resolve_dtype(args.dtype)
+    use_nvtx = device.type == "cuda"
 
     model = BasicsTransformerLM(
         vocab_size=args.vocab_size,
@@ -77,7 +91,8 @@ def main() -> None:
         rope_theta=args.rope_theta,
     ).to(device=device, dtype=dtype)
 
-    model.train(args.mode == "forward_backward")
+    model.train(args.mode != "forward")
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.optimizer_lr)
 
     token_ids = torch.randint(
         low=0,
@@ -89,17 +104,40 @@ def main() -> None:
 
     def forward_step() -> None:
         with torch.no_grad():
-            _ = model(token_ids)
+            with _nvtx_range("forward", use_nvtx):
+                _ = model(token_ids)
         _sync_if_cuda(device)
 
     def forward_backward_step() -> None:
-        model.zero_grad(set_to_none=True)
-        logits = model(token_ids)
-        loss = logits.mean()
-        loss.backward()
+        with _nvtx_range("zero_grad", use_nvtx):
+            model.zero_grad(set_to_none=True)
+        with _nvtx_range("forward", use_nvtx):
+            logits = model(token_ids)
+        with _nvtx_range("loss", use_nvtx):
+            loss = logits.mean()
+        with _nvtx_range("backward", use_nvtx):
+            loss.backward()
         _sync_if_cuda(device)
 
-    step_fn = forward_step if args.mode == "forward" else forward_backward_step
+    def forward_backward_optimizer_step() -> None:
+        with _nvtx_range("zero_grad", use_nvtx):
+            optimizer.zero_grad(set_to_none=True)
+        with _nvtx_range("forward", use_nvtx):
+            logits = model(token_ids)
+        with _nvtx_range("loss", use_nvtx):
+            loss = logits.mean()
+        with _nvtx_range("backward", use_nvtx):
+            loss.backward()
+        with _nvtx_range("optimizer_step", use_nvtx):
+            optimizer.step()
+        _sync_if_cuda(device)
+
+    step_fn_by_mode = {
+        "forward": forward_step,
+        "forward_backward": forward_backward_step,
+        "forward_backward_optimizer": forward_backward_optimizer_step,
+    }
+    step_fn = step_fn_by_mode[args.mode]
 
     for _ in range(args.warmup_steps):
         step_fn()
@@ -114,6 +152,8 @@ def main() -> None:
     print(f"mode: {args.mode}")
     print(f"device: {device}")
     print(f"dtype: {dtype}")
+    if args.mode == "forward_backward_optimizer":
+        print(f"optimizer_lr: {args.optimizer_lr}")
     print(f"warmup_steps (w): {args.warmup_steps}")
     print(f"measure_steps (n): {args.measure_steps}")
     print(f"total_time_seconds: {total_seconds:.6f}")
