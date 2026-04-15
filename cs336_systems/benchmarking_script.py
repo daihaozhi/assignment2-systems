@@ -61,7 +61,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--memory-history-max-entries",
         type=int,
-        default=1000000,
+        default=100000,
         help="max_entries for torch.cuda.memory._record_memory_history().",
     )
 
