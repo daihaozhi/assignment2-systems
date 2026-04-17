@@ -107,8 +107,8 @@ def _check_triton_ready() -> None:
 def _check_flashattention_inputs(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, is_causal: bool) -> None:
     if q.device.type != "cuda" or k.device.type != "cuda" or v.device.type != "cuda":
         raise ValueError("Triton FlashAttention requires CUDA tensors.")
-    if q.dtype not in (torch.float16, torch.bfloat16):
-        raise ValueError("Triton FlashAttention currently expects fp16 or bf16 tensors.")
+    if q.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise ValueError("Triton FlashAttention currently expects fp16, bf16, or fp32 tensors.")
     if q.dtype != k.dtype or q.dtype != v.dtype:
         raise ValueError("q, k, v must have the same dtype.")
     if q.ndim not in (3, 4) or k.ndim != q.ndim or v.ndim != q.ndim:
