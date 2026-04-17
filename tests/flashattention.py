@@ -291,7 +291,6 @@ class FlashAttentionTritonFunction(torch.autograd.Function):
             v_in = v.reshape(b * h, nk, d)
             merged_batch = b * h
             restore_shape = (b, h, nq, d)
-            l_shape = (b, h, nq)
         else:
             merged_batch, nq, d = q.shape
             nk = k.shape[-2]
@@ -299,7 +298,6 @@ class FlashAttentionTritonFunction(torch.autograd.Function):
             k_in = k
             v_in = v
             restore_shape = q.shape
-            l_shape = (merged_batch, nq)
 
         q_tile_size = 64
         k_tile_size = 64
@@ -307,7 +305,7 @@ class FlashAttentionTritonFunction(torch.autograd.Function):
         scale = (1.0 / math.sqrt(d)) if sm_scale is None else float(sm_scale)
 
         o = torch.empty_like(q_in, device=q.device)
-        l = torch.empty(l_shape if q.ndim == 3 else (merged_batch, nq), device=q.device, dtype=torch.float32)
+        l = torch.empty((merged_batch, nq), device=q.device, dtype=torch.float32)
 
         grid = (triton.cdiv(nq, q_tile_size), merged_batch)
         _flashattn_fwd_kernel[grid](
@@ -340,7 +338,12 @@ class FlashAttentionTritonFunction(torch.autograd.Function):
             BLOCK_D=block_d,
         )
 
-        ctx.save_for_backward(q, k, v)
+        if q.ndim == 4:
+            l_to_save = l.reshape(b, h, nq).mean(dim=1)
+        else:
+            l_to_save = l
+
+        ctx.save_for_backward(q, k, v, l_to_save)
         ctx.is_causal = is_causal
         ctx.scale = scale
         ctx.original_ndim = q.ndim
@@ -351,7 +354,7 @@ class FlashAttentionTritonFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, do):
-        q, k, v = ctx.saved_tensors
+        q, k, v, _l = ctx.saved_tensors
         q_grad = q.detach().requires_grad_(True)
         k_grad = k.detach().requires_grad_(True)
         v_grad = v.detach().requires_grad_(True)
