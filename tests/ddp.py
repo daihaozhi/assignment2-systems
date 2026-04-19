@@ -11,9 +11,10 @@ class DDP(nn.Module):
         self._setup_gradient_hooks()
 
     def _broadcast_parameters(self):
-        for param in self.module.parameters():
-            if param.requires_grad:
-                dist.broadcast(param.data, src=0)
+        for name, param in self.module.named_parameters():
+            # We must broadcast all parameters (and buffers usually) to ensure exact equivalence.
+            # But the test checks `no_grad_fixed_param` as well, so we should broadcast everything.
+            dist.broadcast(param.data, src=0)
 
     def _setup_gradient_hooks(self):
         for param in self.module.parameters():
