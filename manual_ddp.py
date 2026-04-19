@@ -7,13 +7,17 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 # ==========================================
-# 1. 定义一个参数量不大的简单模型
+# 1. 定义一个中等规模的模型
 # ==========================================
 class SimpleMLP(nn.Module):
-    def __init__(self, input_dim=1024, hidden_dim=2048, output_dim=10):
+    def __init__(self, input_dim=4096, hidden_dim=8192, output_dim=10):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
@@ -26,7 +30,7 @@ class SimpleMLP(nn.Module):
 # ==========================================
 # 2. 单卡基准训练函数
 # ==========================================
-def train_single_gpu(d_size, global_batch_size, epochs, input_dim=1024):
+def train_single_gpu(d_size, global_batch_size, epochs, input_dim=4096):
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(f"\n[Single Device] Starting training on {device}...")
     
@@ -73,7 +77,7 @@ def train_single_gpu(d_size, global_batch_size, epochs, input_dim=1024):
 # ==========================================
 # 3. 分布式手工 DDP 训练函数
 # ==========================================
-def train_distributed(rank, world_size, d_size, global_batch_size, epochs, input_dim=1024):
+def train_distributed(rank, world_size, d_size, global_batch_size, epochs, input_dim=4096):
     # 配置分布式环境变量
     os.environ['MASTER_ADDR'] = '127.0.0.1'
     os.environ['MASTER_PORT'] = '12356'
@@ -167,9 +171,9 @@ def train_distributed(rank, world_size, d_size, global_batch_size, epochs, input
 # 4. 主函数入口
 # ==========================================
 def main():
-    d_size = 100000            # 总数据规模 (d)
-    global_batch_size = 1000   # 全局批次大小
-    epochs = 10                # 迭代轮数
+    d_size = 200000            # 总数据规模增大一倍
+    global_batch_size = 2000   # 批次大小增大
+    epochs = 15                # 迭代轮数增加
     world_size = 2             # 进程数量 (2张显卡)
 
     # 1. 运行单卡训练并计时
