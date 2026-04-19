@@ -77,7 +77,7 @@ def train_single_gpu(d_size, global_batch_size, epochs, input_dim=4096):
 # ==========================================
 # 3. 分布式手工 DDP 训练函数
 # ==========================================
-def train_distributed(rank, world_size, d_size, global_batch_size, epochs, input_dim=4096):
+def train_distributed(rank, world_size, d_size, global_batch_size, epochs, use_flattened=False, input_dim=4096):
     # 配置分布式环境变量
     os.environ['MASTER_ADDR'] = '127.0.0.1'
     os.environ['MASTER_PORT'] = '12356'
@@ -127,7 +127,8 @@ def train_distributed(rank, world_size, d_size, global_batch_size, epochs, input
     dist.barrier()
 
     if rank == 0:
-        print(f"\n[Distributed] Starting training on {world_size} processes using {backend}...")
+        mode_str = "Flattened" if use_flattened else "Naive"
+        print(f"\n[Distributed - {mode_str}] Starting training on {world_size} processes using {backend}...")
     
     start_time = time.perf_counter()
     
@@ -160,12 +161,27 @@ def train_distributed(rank, world_size, d_size, global_batch_size, epochs, input
             total_compute_time += (t1 - t0)
             
             # 【核心手工 DDP 逻辑】：同步所有进程的梯度，求平均
-            for param in model.parameters():
-                if param.grad is not None:
-                    # 将所有卡上的 param.grad 相加
-                    dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM)
-                    # 求平均
-                    param.grad.data /= world_size
+            if use_flattened:
+                # 1. 展平所有梯度并拼接成一个连续的 1D Tensor
+                grads = [param.grad.data.view(-1) for param in model.parameters() if param.grad is not None]
+                if grads:
+                    flat_grad = torch.cat(grads)
+                    # 2. 对这个巨大的 1D Tensor 执行一次 All-Reduce，节省发起通信的开销
+                    dist.all_reduce(flat_grad, op=dist.ReduceOp.SUM)
+                    flat_grad /= world_size
+                    # 3. 将平均后的梯度切片并复制回原网络各层的梯度
+                    offset = 0
+                    for param in model.parameters():
+                        if param.grad is not None:
+                            numel = param.numel()
+                            param.grad.data.copy_(flat_grad[offset:offset+numel].view_as(param.grad.data))
+                            offset += numel
+            else:
+                # 原始逻辑：逐层逐个 Parameter 发起 All-Reduce
+                for param in model.parameters():
+                    if param.grad is not None:
+                        dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM)
+                        param.grad.data /= world_size
 
             # 参数更新
             optimizer.step()
@@ -183,7 +199,7 @@ def train_distributed(rank, world_size, d_size, global_batch_size, epochs, input
 
     if rank == 0:
         total_time = end_time - start_time
-        print(f"[Distributed] Completed! Time taken: {total_time:.4f} seconds")
+        print(f"[Distributed - {mode_str}] Completed! Time taken: {total_time:.4f} seconds")
         print(f"  - Total Compute Time: {total_compute_time:.4f} s")
         print(f"  - Total Comm & Update Time: {total_comm_time:.4f} s")
 
@@ -201,9 +217,15 @@ def main():
     # 1. 运行单卡训练并计时
     time_single = train_single_gpu(d_size, global_batch_size, epochs)
 
-    # 2. 运行分布式手工 DDP 训练并计时
+    # 2. 运行分布式手工 DDP (逐层 Naive All-Reduce)
+    ##mp.spawn(train_distributed,
+    ##         args=(world_size, d_size, global_batch_size, epochs, False),
+    ##         nprocs=world_size,
+    ##         join=True)
+
+    # 3. 运行分布式手工 DDP (梯度展平 Flattened All-Reduce)
     mp.spawn(train_distributed,
-             args=(world_size, d_size, global_batch_size, epochs),
+             args=(world_size, d_size, global_batch_size, epochs, True),
              nprocs=world_size,
              join=True)
 
