@@ -109,17 +109,39 @@ def train_distributed(rank, world_size, d_size, global_batch_size, epochs, use_f
     # 局部批次大小 (维持相同的更新步数)
     local_batch_size = global_batch_size // world_size
 
+    # ==========================================
+    # 【预分配连续显存池】: 避免每次 iter 都进行昂贵的 torch.cat 和 copy_
+    # ==========================================
+    flat_grad_buffer = None
+    if use_flattened:
+        # 计算所有需要梯度的参数的总元素数
+        total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        # 在设备上预分配一块连续的大张量作为梯度的归宿
+        flat_grad_buffer = torch.zeros(total_params, device=device, dtype=torch.float32)
+        
+        offset = 0
+        for p in model.parameters():
+            if p.requires_grad:
+                numel = p.numel()
+                # 让每一层的梯度指针 (.grad) 都直接映射 (view) 到这块连续的内存上
+                p.grad = flat_grad_buffer[offset:offset+numel].view_as(p)
+                offset += numel
+
     # 随机生成每个进程私有的局部数据
     inputs = torch.randn(local_d_size, input_dim, device=device)
     targets = torch.randint(0, 10, (local_d_size,), device=device)
 
     # 预热一次
-    optimizer.zero_grad()
+    optimizer.zero_grad(set_to_none=False)  # 必须设为False，防止清空时把预分配的 buffer 给销毁掉
     loss = criterion(model(inputs[:local_batch_size]), targets[:local_batch_size])
     loss.backward()
-    for param in model.parameters():
-        dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM)
-        param.grad.data /= world_size
+    if use_flattened:
+        dist.all_reduce(flat_grad_buffer, op=dist.ReduceOp.SUM)
+        flat_grad_buffer /= world_size
+    else:
+        for param in model.parameters():
+            dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM)
+            param.grad.data /= world_size
     optimizer.step()
 
     if device.type == "cuda":
@@ -147,11 +169,11 @@ def train_distributed(rank, world_size, d_size, global_batch_size, epochs, use_f
             t0 = time.perf_counter()
             
             # 前向传播
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=False)  # 非常重要：不能清空我们绑定的 flat buffer
             outputs = model(x)
             loss = criterion(outputs, y)
             
-            # 反向传播计算局部梯度
+            # 反向传播计算局部梯度 (此时梯度会直接写进 flat_grad_buffer 各自对应的切片中)
             loss.backward()
             
             # --- 记录计算结束 / 通信开始时间 ---
@@ -162,20 +184,10 @@ def train_distributed(rank, world_size, d_size, global_batch_size, epochs, use_f
             
             # 【核心手工 DDP 逻辑】：同步所有进程的梯度，求平均
             if use_flattened:
-                # 1. 展平所有梯度并拼接成一个连续的 1D Tensor
-                grads = [param.grad.data.view(-1) for param in model.parameters() if param.grad is not None]
-                if grads:
-                    flat_grad = torch.cat(grads)
-                    # 2. 对这个巨大的 1D Tensor 执行一次 All-Reduce，节省发起通信的开销
-                    dist.all_reduce(flat_grad, op=dist.ReduceOp.SUM)
-                    flat_grad /= world_size
-                    # 3. 将平均后的梯度切片并复制回原网络各层的梯度
-                    offset = 0
-                    for param in model.parameters():
-                        if param.grad is not None:
-                            numel = param.numel()
-                            param.grad.data.copy_(flat_grad[offset:offset+numel].view_as(param.grad.data))
-                            offset += numel
+                # 因为模型各层的 param.grad 都是 flat_grad_buffer 的 view
+                # 所以只要对这一整块显存执行 all_reduce，所有层的梯度就瞬间全同步好了，0 次多余内存拷贝！
+                dist.all_reduce(flat_grad_buffer, op=dist.ReduceOp.SUM)
+                flat_grad_buffer /= world_size
             else:
                 # 原始逻辑：逐层逐个 Parameter 发起 All-Reduce
                 for param in model.parameters():
