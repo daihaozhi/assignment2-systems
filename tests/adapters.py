@@ -5,6 +5,7 @@ from typing import Type
 import torch
 from . import flashattention
 from . import ddp
+from . import sharded_optimizer
 
 def get_flashattention_autograd_function_pytorch() -> Type:
     """
@@ -136,4 +137,8 @@ def get_sharded_optimizer(params, optimizer_cls: Type[torch.optim.Optimizer], **
     Returns:
         Instance of sharded optimizer.
     """
-    raise NotImplementedError
+    return sharded_optimizer.ShardedOptimizer(
+        params=params,
+        optimizer_cls=optimizer_cls,
+        **kwargs,
+    )
