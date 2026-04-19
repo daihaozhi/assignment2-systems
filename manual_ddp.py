@@ -130,12 +130,20 @@ def train_distributed(rank, world_size, d_size, global_batch_size, epochs, input
         print(f"\n[Distributed] Starting training on {world_size} processes using {backend}...")
     
     start_time = time.perf_counter()
+    
+    total_compute_time = 0.0
+    total_comm_time = 0.0
 
     # 模拟训练
     for epoch in range(epochs):
         for i in range(0, local_d_size, local_batch_size):
             x = inputs[i:i+local_batch_size]
             y = targets[i:i+local_batch_size]
+            
+            # --- 记录计算开始时间 ---
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            t0 = time.perf_counter()
             
             # 前向传播
             optimizer.zero_grad()
@@ -144,6 +152,12 @@ def train_distributed(rank, world_size, d_size, global_batch_size, epochs, input
             
             # 反向传播计算局部梯度
             loss.backward()
+            
+            # --- 记录计算结束 / 通信开始时间 ---
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            t1 = time.perf_counter()
+            total_compute_time += (t1 - t0)
             
             # 【核心手工 DDP 逻辑】：同步所有进程的梯度，求平均
             for param in model.parameters():
@@ -155,6 +169,12 @@ def train_distributed(rank, world_size, d_size, global_batch_size, epochs, input
 
             # 参数更新
             optimizer.step()
+            
+            # --- 记录通信结束时间 ---
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            t2 = time.perf_counter()
+            total_comm_time += (t2 - t1)
 
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -164,6 +184,8 @@ def train_distributed(rank, world_size, d_size, global_batch_size, epochs, input
     if rank == 0:
         total_time = end_time - start_time
         print(f"[Distributed] Completed! Time taken: {total_time:.4f} seconds")
+        print(f"  - Total Compute Time: {total_compute_time:.4f} s")
+        print(f"  - Total Comm & Update Time: {total_comm_time:.4f} s")
 
     dist.destroy_process_group()
 
