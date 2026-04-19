@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Iterable
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -29,9 +29,6 @@ class ShardedOptimizer(optim.Optimizer):
         self.rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
         self.world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
 
-        # Let Optimizer normalize input params/param_groups.
-        super().__init__(params, kwargs)
-
         # Global deterministic ownership metadata.
         self._param_owner_by_id: dict[int, int] = {}
         self._ordered_unique_params: list[torch.nn.Parameter] = []
@@ -39,6 +36,13 @@ class ShardedOptimizer(optim.Optimizer):
 
         # Local wrapped optimizer (only this rank's shard).
         self._local_optimizer: optim.Optimizer | None = None
+
+        # During super().__init__, torch Optimizer will invoke self.add_param_group.
+        # Guard that phase and finish sharding setup after canonical groups are ready.
+        self._initializing = True
+        super().__init__(params, kwargs)
+        self._initializing = False
+
         self._initialize_local_optimizer()
 
     def _build_local_param_group(self, group: dict[str, Any], assign_new: bool) -> dict[str, Any] | None:
@@ -96,6 +100,11 @@ class ShardedOptimizer(optim.Optimizer):
     def add_param_group(self, param_group: dict[str, Any]):
         # Add to global optimizer metadata first.
         super().add_param_group(param_group)
+
+        # Optimizer.__init__ already calls this method while constructing param_groups.
+        # Delay sharding/local-optimizer wiring until __init__ finishes.
+        if getattr(self, "_initializing", False):
+            return
 
         # The canonicalized group is appended by Optimizer.add_param_group.
         canonical_group = self.param_groups[-1]
